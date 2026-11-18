@@ -53,11 +53,6 @@ O arquivo começa com um índice das seções, e as decisões de projeto estão 
 
 Baixe o `index.html` e abra no Chrome (ou Edge, Firefox, Safari recentes). Não precisa instalar nada.
 
-## Publicar no GitHub Pages (link pra jogar)
-
-1. No repositório, vá em **Settings → Pages**.
-2. Em **Source**, escolha **Deploy from a branch**, branch **main** e pasta **/ (root)**, e clique em **Save**.
-3. Em um ou dois minutos, o jogo fica disponível em `https://SEU-USUARIO.github.io/mini-gta-js/`.
 
 ## Estrutura
 
