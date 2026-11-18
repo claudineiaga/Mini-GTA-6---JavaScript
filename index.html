@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meu mini GTA</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07070c; overflow: hidden; }
+  body { display: grid; place-items: center; }
+  canvas { height: min(100vh, 177.7vw); display: block; outline: none; cursor: pointer; touch-action: none; user-select: none; }
+</style>
+</head>
+<body>
+<canvas id="tela" tabindex="0"></canvas>
+<script>
+/*
+  MEU MINI GTA — HTML + JavaScript puro (Canvas 2D), sem bibliotecas e sem imagens.
+
+  Como o arquivo está organizado:
+    CONFIGURAÇÃO   constantes do jogo (tamanho da tela, da quadra, cores)
+    FERRAMENTAS    teclado, funções matemáticas e de desenho reaproveitadas
+    CIDADE         geração procedural das quadras (prédios, parques) e colisão
+    VEÍCULOS       física do carro (derrapagem), marcas de pneu e batidas
+    ESTADO         variáveis do jogo e troca de passo (1 a 4)
+    TRÂNSITO       carros na mão certa que freiam se tiver alguém na frente
+    PEDESTRES      gente andando na calçada, fugindo e sendo atropelada
+    POLÍCIA        estrelas de procurado, perseguição e prisão
+    PARTÍCULAS     fumaça e faíscas
+    TOQUE          botões na tela para jogar no celular
+    ATUALIZAÇÃO    um passo da simulação (roda 60 vezes por segundo)
+    DESENHO        chão, luzes, carros, prédios em 3D, HUD e minimapa
+    LOOP           junta tudo
+*/
+
+// ================= CONFIGURAÇÃO =================
+let PASSO = 1;            // 1 carro · 2 cidade 3D · 3 trânsito e pedestres · 4 noite e polícia (teclas 1 a 4)
+let NOITE = PASSO >= 4;
+const W = 360, H = 640, ESCALA = 2;           // tela vertical 9:16, renderizada em 720x1280
+const QUADRA = 220, RUA = 64, CALCADA = 12;   // a cidade é uma quadra de 220px repetida pra sempre
+const CAMERA = 1000;                          // altura da câmera: dá a perspectiva dos prédios
+const CORES_CARROS = ['#e8e8e8', '#2f6fd6', '#f2c230', '#3aa55a', '#9a3fd1', '#26262c', '#d9772b'];
+const ROUPAS = ['#e34b4b', '#3a7bd5', '#f2c94c', '#27ae60', '#9b51e0', '#f2994a', '#eeeeee'];
+const PALETA = ['#5b6c8f', '#8f6b5b', '#6f8f6b', '#8a5b7a', '#7d7d86', '#a08a5a'];
+const NEON = ['#ff2bd6', '#00e5ff', '#ffe600', '#7cff4f'];
+
+const tela = document.getElementById('tela');
+tela.width = W * ESCALA; tela.height = H * ESCALA;
+const ctx = tela.getContext('2d');
+tela.focus();                                  // o teclado só chega no jogo se a página estiver com foco
+addEventListener('pointerdown', () => { window.focus(); tela.focus(); });
+
+// ================= FERRAMENTAS =================
+const teclas = {};
+onkeydown = e => {
+  teclas[e.code] = true;
+  if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+  if (/^Digit[1-4]$/.test(e.code)) mudarPasso(+e.code[5]);
+};
+onkeyup = e => teclas[e.code] = false;
+onblur = () => { for (const k in teclas) teclas[k] = false; };   // perdeu o foco: solta tudo (senão o carro acelera sozinho)
+const tecla = (...codigos) => codigos.some(c => teclas[c]);
+const hash = (a, b, c = 0) => { const s = Math.sin(a * 127.1 + b * 311.7 + c * 74.7) * 43758.5453; return s - Math.floor(s); };
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const anguloEntre = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
+const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+const sorteio = lista => lista[Math.floor(Math.random() * lista.length)];
+
+const cacheCor = new Map();
+function cor(hex, f = 1) {                    // escurece/clareia a cor; à noite puxa pro azul
+  const chave = hex + f + NOITE;
+  if (!cacheCor.has(chave)) {
+    const n = parseInt(hex.slice(1), 16), noite = NOITE ? [0.35, 0.4, 0.55] : [1, 1, 1];
+    const c = [n >> 16, (n >> 8) & 255, n & 255].map((v, k) => Math.min(255, v * f * noite[k]) | 0);
+    cacheCor.set(chave, `rgb(${c})`);
+  }
+  return cacheCor.get(chave);
+}
+function poligono(pontos, contorno) {
+  ctx.beginPath();
+  pontos.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  ctx.closePath();
+  contorno ? ctx.stroke() : ctx.fill();
+}
+function circulo(x, y, r) { ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); }
+function retangulo(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); ctx.fill(); }
+function brilho(x, y, r, rgb, a) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(${rgb},${a})`); g.addColorStop(1, `rgba(${rgb},0)`);
+  ctx.fillStyle = g; circulo(x, y, r);
+}
+
+// ================= CIDADE =================
+const cacheQuadras = new Map();
+function quadra(i, j) {                        // cada quadra é gerada a partir de (i, j): sempre igual
+  const chave = i + ',' + j;
+  if (cacheQuadras.has(chave)) return cacheQuadras.get(chave);
+  if (cacheQuadras.size > 3000) cacheQuadras.clear();          // não deixa a memória crescer sem fim
+  const x0 = i * QUADRA + RUA + CALCADA, y0 = j * QUADRA + RUA + CALCADA, lado = QUADRA - RUA - 2 * CALCADA;
+  const q = { x0, y0, lado, parque: hash(i, j, 9) < 0.12, predios: [], arvores: [] };
+  if (q.parque) {
+    for (let k = 0; k < 7; k++)
+      q.arvores.push({ x: x0 + 15 + hash(i, j, k) * (lado - 30), y: y0 + 15 + hash(j, i, k) * (lado - 30), r: 10 + hash(i, k, j) * 8 });
+  } else {
+    const div = hash(i, j, 1) < 0.5 ? 1 : 2;    // um prédio grande ou quatro menores
+    const t = (lado - (div - 1) * 10) / div;
+    for (let a = 0; a < div; a++) for (let b = 0; b < div; b++) {
+      const n = a * 2 + b;
+      q.predios.push({
+        x: x0 + a * (t + 10), y: y0 + b * (t + 10), w: t, h: t, semente: i * 31 + j * 17 + n,
+        alt: 40 + hash(i, j, n + 2) * (div === 1 ? 220 : 120),
+        cor: PALETA[Math.floor(hash(j, i, n) * PALETA.length)],
+        neon: hash(i, j, n + 5) < 0.3 ? NEON[Math.floor(hash(i, n, j) * NEON.length)] : null,
+      });
+    }
+  }
+  cacheQuadras.set(chave, q);
+  return q;
+}
+function paraCadaQuadra(v, fn) {
+  for (let i = Math.floor(v.x0 / QUADRA) - 1; i <= Math.floor(v.x1 / QUADRA) + 1; i++)
+    for (let j = Math.floor(v.y0 / QUADRA) - 1; j <= Math.floor(v.y1 / QUADRA) + 1; j++) fn(i, j);
+}
+function solido(x, y, m = 8) {                 // tem prédio nesse ponto?
+  if (PASSO < 2) return false;
+  const q = quadra(Math.floor(x / QUADRA), Math.floor(y / QUADRA));
+  return q.predios.some(p => x > p.x - m && x < p.x + p.w + m && y > p.y - m && y < p.y + p.h + m);
+}
+
+// ================= VEÍCULOS =================
+function novoVeiculo(x, y, ang, corCarro) { return { x, y, ang, vx: 0, vy: 0, cor: corCarro, batido: false }; }
+
+function moverVeiculo(v, acel, vira, freioDeMao, potencia) {
+  const fx = Math.cos(v.ang), fy = Math.sin(v.ang);
+  let frente = v.vx * fx + v.vy * fy;          // velocidade pra frente
+  let lado = v.vy * fx - v.vx * fy;            // velocidade de lado = derrapagem
+  frente = (frente + acel * potencia) * (acel ? 0.985 : 0.97);
+  if (freioDeMao) frente *= 0.985;
+  frente = Math.max(frente, -2.5);             // ré mais lenta
+  lado *= freioDeMao ? 0.97 : 0.84;            // o pneu segura a lateral... ou não
+  const giro = Math.sign(frente) * Math.min(Math.abs(frente) * 0.016, 0.05);  // devagar vira mais fechado
+  v.ang += vira * giro * (freioDeMao ? 1.7 : 1);
+  v.vx = fx * frente - fy * lado;
+  v.vy = fy * frente + fx * lado;
+  v.derrapagem = Math.abs(lado);
+  let impacto = 0;                             // bateu em prédio? volta e perde velocidade
+  if (solido(v.x + v.vx, v.y)) { impacto = Math.abs(v.vx); v.vx *= -0.35; } else v.x += v.vx;
+  if (solido(v.x, v.y + v.vy)) { impacto = Math.max(impacto, Math.abs(v.vy)); v.vy *= -0.35; } else v.y += v.vy;
+  return impacto;
+}
+
+function rastro(v) {                           // marca de pneu + fumaça quando derrapa
+  const derrapando = v.derrapagem > 1.5;
+  const fx = Math.cos(v.ang), fy = Math.sin(v.ang);
+  const rodas = [[-10, -6], [-10, 6]].map(([a, b]) => [v.x + fx * a - fy * b, v.y + fy * a + fx * b]);
+  if (derrapando && v.rodas) {
+    rodas.forEach((r, k) => marcas.push([v.rodas[k][0], v.rodas[k][1], r[0], r[1]]));
+    if (Math.random() < 0.5) particulas.push(fumaca(rodas[0][0], rodas[0][1]));
+  }
+  v.rodas = derrapando ? rodas : null;
+  if (marcas.length > 900) marcas.splice(0, marcas.length - 900);
+}
+
+function colidir(a, b, aoBater) {              // batida entre dois veículos
+  const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+  if (d > 24 || d === 0) return;
+  const nx = dx / d, ny = dy / d, empurra = (24 - d) / 2;
+  if (!solido(a.x - nx * empurra, a.y - ny * empurra)) { a.x -= nx * empurra; a.y -= ny * empurra; }
+  if (!solido(b.x + nx * empurra, b.y + ny * empurra)) { b.x += nx * empurra; b.y += ny * empurra; }
+  const impacto = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
+  if (impacto <= 0) return;
+  a.vx -= nx * impacto * 0.8; a.vy -= ny * impacto * 0.8;
+  b.vx += nx * impacto * 0.6; b.vy += ny * impacto * 0.6;
+  if (impacto > 1.5) aoBater(impacto, (a.x + b.x) / 2, (a.y + b.y) / 2);
+}
+
+// ================= ESTADO DO JOGO =================
+const jogador = novoVeiculo(RUA / 2, QUADRA * 2 + 140, -Math.PI / 2, '#ff3b5c');
+const transito = [], pedestres = [], policia = [], marcas = [], particulas = [];
+const cam = { x: jogador.x, y: jogador.y, zoom: 1 };
+let quadro = 0, procurado = 0, fuga = 0, prisao = 0, mostrandoPreso = 0, tremor = 0, dica = 300;
+
+function mudarPasso(n) {
+  PASSO = n; NOITE = n >= 4;
+  if (solido(jogador.x, jogador.y)) jogador.x = Math.round((jogador.x - RUA / 2) / QUADRA) * QUADRA + RUA / 2;
+  if (n < 3) { transito.length = 0; pedestres.length = 0; }
+  if (n >= 3 && !transito.length) {
+    for (let k = 0; k < 18; k++) transito.push(novoCarroTransito(true));
+    for (let k = 0; k < 40; k++) pedestres.push(novoPedestre());
+  }
+  if (n < 4) { policia.length = 0; procurado = 0; }
+}
+
+// ================= TRÂNSITO =================
+function novoCarroTransito(perto) {
+  const vert = Math.random() < 0.5, s = Math.random() < 0.5 ? 1 : -1;
+  const linha = (Math.floor((vert ? jogador.x : jogador.y) / QUADRA) + Math.floor(Math.random() * 5) - 2) * QUADRA;
+  const faixa = (vert ? s > 0 : s < 0) ? 16 : 48;                      // mão à direita
+  const base = vert ? jogador.y : jogador.x;
+  let longe = perto ? base + Math.random() * 800 - 400 : base - s * (500 + Math.random() * 200);
+  if (Math.abs(longe - base) < 120) longe += 300;                   // nunca nasce em cima do jogador
+  const c = novoVeiculo(vert ? linha + faixa : longe, vert ? longe : linha + faixa,
+                        vert ? s * Math.PI / 2 : (s > 0 ? 0 : Math.PI), sorteio(CORES_CARROS));
+  c.velAlvo = 2 + Math.random() * 1.2; c.vel = c.velAlvo;
+  return c;
+}
+function temAlguemNaFrente(c) {
+  const fx = Math.cos(c.ang), fy = Math.sin(c.ang);
+  return [jogador, ...transito, ...policia].some(o => {
+    if (o === c || (o !== jogador && Math.cos(o.ang - c.ang) < 0.7)) return false;
+    const dx = o.x - c.x, dy = o.y - c.y, frente = dx * fx + dy * fy;
+    return frente > 0 && frente < 50 && Math.abs(dy * fx - dx * fy) < 14;
+  });
+}
+function atualizarTransito() {
+  transito.forEach((c, k) => {
+    if (dist(c, jogador) > 900) return transito[k] = novoCarroTransito();
+    if (c.batido) {                            // carro batido: desliza, para e solta fumaça
+      c.vx *= 0.9; c.vy *= 0.9; c.x += c.vx; c.y += c.vy;
+      if (Math.random() < 0.12) particulas.push(fumaca(c.x, c.y, true));
+      return;
+    }
+    c.vel += ((temAlguemNaFrente(c) ? 0 : c.velAlvo) - c.vel) * 0.08;
+    c.vx = Math.cos(c.ang) * c.vel; c.vy = Math.sin(c.ang) * c.vel;
+    c.x += c.vx; c.y += c.vy;
+  });
+}
+function bateuEmCarro(c, impacto, x, y, velJogador) {   // velJogador = velocidade ANTES da batida
+  faiscas(x, y, impacto); tremor = Math.min(8, impacto * 1.5);
+  if (c.batido) return;
+  c.batido = true;
+  if (PASSO >= 4 && velJogador > 1) { procurado = Math.min(5, procurado + 1); fuga = 0; }   // parado e empurrado não conta
+}
+
+// ================= PEDESTRES =================
+const LADO = QUADRA - RUA - CALCADA;           // tamanho de cada lado da calçada
+function novoPedestre() {
+  return {
+    i: Math.floor(jogador.x / QUADRA) + Math.floor(Math.random() * 5) - 2,
+    j: Math.floor(jogador.y / QUADRA) + Math.floor(Math.random() * 7) - 3,
+    t: Math.random() * 4 * LADO, vel: (0.3 + Math.random() * 0.3) * (Math.random() < 0.5 ? 1 : -1),
+    susto: 0, cor: sorteio(ROUPAS),
+  };
+}
+function atualizarPedestres() {
+  pedestres.forEach((p, k) => {
+    if (p.caido) {                             // atropelado: é jogado longe e fica no chão
+      if (solido(p.x + p.vx, p.y + p.vy, 2)) { p.vx = 0; p.vy = 0; }   // não atravessa prédio
+      p.x += p.vx; p.y += p.vy; p.vx *= 0.9; p.vy *= 0.9; p.ang += p.giro; p.giro *= 0.9;
+      if (dist(p, jogador) > 800) pedestres[k] = novoPedestre();
+      return;
+    }
+    p.t += p.vel * (p.susto > 0 ? 4 : 1);
+    if (p.susto > 0) p.susto--;
+    const t = ((p.t % (4 * LADO)) + 4 * LADO) % (4 * LADO), lado = Math.floor(t / LADO), u = t % LADO;
+    const x0 = p.i * QUADRA + RUA + CALCADA / 2, y0 = p.j * QUADRA + RUA + CALCADA / 2;
+    [p.x, p.y] = [[x0 + u, y0], [x0 + LADO, y0 + u], [x0 + LADO - u, y0 + LADO], [x0, y0 + LADO - u]][lado];
+    p.ang = lado * Math.PI / 2 + (p.vel < 0 ? Math.PI : 0);
+    const d = dist(p, jogador), vel = Math.hypot(jogador.vx, jogador.vy);
+    if (d < 55 && vel > 1.5) p.susto = 50;     // carro vindo: sai correndo
+    if (d < 18 && vel > 2) {                   // atropelou!
+      p.caido = true; p.vx = jogador.vx * 0.7; p.vy = jogador.vy * 0.7; p.giro = (Math.random() - 0.5) * 0.6;
+      jogador.vx *= 0.85; jogador.vy *= 0.85; tremor = 3;
+      if (PASSO >= 4) { procurado = Math.min(5, procurado + 1); fuga = 0; }
+    } else if (d < 18) p.t += Math.sign(p.vel) * 30;   // carro devagar: dá um pulo e desvia
+    if (d > 800) pedestres[k] = novoPedestre();
+  });
+}
+
+// ================= POLÍCIA =================
+function novaViatura() {
+  const a = Math.random() * Math.PI * 2;
+  const i = Math.round((jogador.x + Math.cos(a) * 480) / QUADRA), j = Math.round((jogador.y + Math.sin(a) * 480) / QUADRA);
+  const v = novoVeiculo(i * QUADRA + RUA / 2, j * QUADRA + RUA / 2, a + Math.PI, '#f4f4f4');  // nasce num cruzamento
+  v.policia = true; v.travado = 0; v.re = 0; v.fase = Math.random() < 0.5 ? 0 : 1;   // fase: qual cor pisca primeiro
+  return v;
+}
+function atualizarPolicia() {
+  const quantas = Math.min(procurado, 4);
+  while (policia.length < quantas) policia.push(novaViatura());
+  policia.sort((a, b) => dist(a, jogador) - dist(b, jogador)).length = quantas;
+  policia.forEach((p, k) => {
+    if (dist(p, jogador) > 1000) return policia[k] = novaViatura();
+    const d = dist(p, jogador);
+    let acel = d < 70 ? 0.15 : 1;              // chegando perto: vai devagar pra encurralar
+    let vira = Math.max(-1, Math.min(1, anguloEntre(p.ang, Math.atan2(jogador.y - p.y, jogador.x - p.x)) * 2));
+    const olhar = da => solido(p.x + Math.cos(p.ang + da) * 45, p.y + Math.sin(p.ang + da) * 45, 4);
+    if (olhar(0)) vira = !olhar(0.6) ? 1 : !olhar(-0.6) ? -1 : vira;     // desvia do prédio
+    p.travado = Math.hypot(p.vx, p.vy) < 0.6 && d > 80 ? p.travado + 1 : 0;
+    if (p.travado > 40) { p.re = 45; p.travado = 0; }                    // travou? dá ré
+    if (p.re > 0) { p.re--; acel = -1; }
+    moverVeiculo(p, acel, vira, false, 0.083);
+    rastro(p);
+    colidir(p, jogador, () => tremor = 4);
+    transito.forEach(c => colidir(p, c, () => c.batido = true));
+  });
+  fuga = policia.some(p => dist(p, jogador) < 380) ? 0 : fuga + 1;       // longe da polícia por 7s: perde 1 estrela
+  if (procurado > 0 && fuga > 420) { procurado--; fuga = 0; }
+  const cercado = policia.some(p => dist(p, jogador) < 45) && Math.hypot(jogador.vx, jogador.vy) < 1.5;
+  prisao = cercado ? prisao + 1 : Math.max(0, prisao - 2);
+  if (prisao > 100) { mostrandoPreso = 180; procurado = 0; prisao = 0; policia.length = 0; }
+}
+
+// ================= PARTÍCULAS =================
+const fumaca = (x, y, escura) => ({ x, y, vx: (Math.random() - 0.5) * 0.6, vy: (Math.random() - 0.5) * 0.6, r: 4, vida: 1, tipo: escura ? 'fumacaEscura' : 'fumaca' });
+function faiscas(x, y, forca) {
+  for (let k = 0; k < forca * 5; k++) {
+    const a = Math.random() * 6.28, s = Math.random() * forca * 1.2;
+    particulas.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, r: 1.6, vida: 1, tipo: 'faisca' });
+  }
+}
+function atualizarParticulas() {
+  particulas.forEach(p => {
+    p.x += p.vx; p.y += p.vy; p.vx *= 0.94; p.vy *= 0.94;
+    p.vida -= p.tipo === 'faisca' ? 0.04 : 0.015;
+    if (p.tipo !== 'faisca') p.r += 0.3;
+  });
+  for (let k = particulas.length - 1; k >= 0; k--) if (particulas[k].vida <= 0) particulas.splice(k, 1);
+}
+
+// ================= TOQUE (celular) =================
+const TOQUE = matchMedia('(pointer: coarse)').matches;   // só aparece em tela de toque
+const BOTOES = [
+  { cod: 'ArrowLeft', x: 48, y: H - 64, r: 32, txt: '◀' },
+  { cod: 'ArrowRight', x: 122, y: H - 64, r: 32, txt: '▶' },
+  { cod: 'Space', x: W - 128, y: H - 56, r: 26, txt: '↯' },
+  { cod: 'ArrowUp', x: W - 52, y: H - 100, r: 34, txt: '▲' },
+  { cod: 'ArrowDown', x: W - 52, y: H - 34, r: 24, txt: '▼' },
+];
+const BOTOES_PASSO = [1, 2, 3, 4].map(n => ({ n, x: 24 + (n - 1) * 36, y: 30, r: 15 }));
+const dedos = new Map();                       // cada dedo na tela -> botão que ele está apertando
+function botaoNoPonto(e) {
+  const r = tela.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width * W, y = (e.clientY - r.top) / r.height * H;
+  return { botao: BOTOES.find(b => Math.hypot(x - b.x, y - b.y) < b.r * 1.3), passo: BOTOES_PASSO.find(b => Math.hypot(x - b.x, y - b.y) < b.r * 1.4) };
+}
+function sincronizarDedos() {
+  BOTOES.forEach(b => teclas[b.cod] = [...dedos.values()].includes(b.cod));
+}
+if (TOQUE) {
+  tela.addEventListener('pointerdown', e => {
+    const { botao, passo } = botaoNoPonto(e);
+    if (passo) mudarPasso(passo.n);
+    if (botao) { dedos.set(e.pointerId, botao.cod); tela.setPointerCapture(e.pointerId); sincronizarDedos(); }
+    dica = Math.min(dica, 60);
+  });
+  tela.addEventListener('pointermove', e => {     // arrastar o dedo de um botão pro outro também funciona
+    if (!dedos.has(e.pointerId)) return;
+    const { botao } = botaoNoPonto(e);
+    dedos.set(e.pointerId, botao ? botao.cod : null); sincronizarDedos();
+  });
+  const soltar = e => { dedos.delete(e.pointerId); sincronizarDedos(); };
+  tela.addEventListener('pointerup', soltar); tela.addEventListener('pointercancel', soltar);
+}
+function desenharBotoes() {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  BOTOES.forEach(b => {
+    ctx.fillStyle = teclas[b.cod] ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.14)'; circulo(b.x, b.y, b.r);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)'; ctx.font = `bold ${Math.round(b.r * 0.8)}px sans-serif`; ctx.fillText(b.txt, b.x, b.y + 1);
+  });
+  BOTOES_PASSO.forEach(b => {
+    ctx.fillStyle = PASSO === b.n ? '#ffd200' : 'rgba(255,255,255,0.18)'; circulo(b.x, b.y, b.r);
+    ctx.fillStyle = PASSO === b.n ? '#000' : '#fff'; ctx.font = 'bold 14px sans-serif'; ctx.fillText(b.n, b.x, b.y + 1);
+  });
+  ctx.textBaseline = 'alphabetic';
+}
+
+// ================= ATUALIZAÇÃO =================
+function atualizar() {
+  quadro++;
+  if (dica < 300 && dica > 0) dica--;
+  if (mostrandoPreso > 0) mostrandoPreso--;
+  const livre = mostrandoPreso === 0;
+  const acel = livre ? (tecla('ArrowUp', 'KeyW') ? 1 : 0) - (tecla('ArrowDown', 'KeyS') ? 1 : 0) : 0;
+  const vira = (tecla('ArrowRight', 'KeyD') ? 1 : 0) - (tecla('ArrowLeft', 'KeyA') ? 1 : 0);
+  if (acel || vira) dica = Math.min(dica, 60);
+  const impacto = moverVeiculo(jogador, acel, vira, tecla('Space'), 0.09);
+  if (impacto > 2) { faiscas(jogador.x, jogador.y, impacto); tremor = Math.min(8, impacto * 1.5); }
+  rastro(jogador);
+  if (PASSO >= 3) {
+    atualizarTransito(); atualizarPedestres();
+    const velAntes = Math.hypot(jogador.vx, jogador.vy);
+    transito.forEach(c => colidir(jogador, c, (imp, x, y) => bateuEmCarro(c, imp, x, y, velAntes)));
+  }
+  if (PASSO >= 4) atualizarPolicia();
+  atualizarParticulas();
+  // câmera: olha um pouco à frente e sobe quando o carro acelera
+  const vel = Math.hypot(jogador.vx, jogador.vy);
+  cam.x += (jogador.x + jogador.vx * 14 - cam.x) * 0.08;
+  cam.y += (jogador.y + jogador.vy * 14 - cam.y) * 0.08;
+  cam.zoom += (1.05 - vel * 0.035 - cam.zoom) * 0.03;
+  tremor *= 0.88;
+}
+
+// ================= DESENHO =================
+function desenharChao(v) {
+  ctx.fillStyle = cor('#34343b');
+  ctx.fillRect(v.x0 - 50, v.y0 - 50, v.x1 - v.x0 + 100, v.y1 - v.y0 + 100);
+  if (PASSO < 2) {                             // passo 1: só asfalto com pontinhos pra ver o movimento
+    ctx.fillStyle = cor('#4a4a54');
+    for (let x = Math.floor(v.x0 / 80) * 80; x < v.x1; x += 80)
+      for (let y = Math.floor(v.y0 / 80) * 80; y < v.y1; y += 80) ctx.fillRect(x, y, 4, 4);
+    return;
+  }
+  paraCadaQuadra(v, (i, j) => {
+    const q = quadra(i, j), bx = i * QUADRA, by = j * QUADRA;
+    ctx.fillStyle = cor('#7c7c84');            // calçada
+    ctx.fillRect(bx + RUA, by + RUA, QUADRA - RUA, QUADRA - RUA);
+    ctx.fillStyle = cor(q.parque ? '#3d7a3a' : '#5a5a62');
+    ctx.fillRect(q.x0, q.y0, q.lado, q.lado);
+    ctx.strokeStyle = cor('#e0c341'); ctx.lineWidth = 2; ctx.setLineDash([12, 12]);
+    ctx.beginPath();                           // faixa amarela do meio da rua
+    ctx.moveTo(bx + RUA / 2, by + RUA); ctx.lineTo(bx + RUA / 2, by + QUADRA);
+    ctx.moveTo(bx + RUA, by + RUA / 2); ctx.lineTo(bx + QUADRA, by + RUA / 2);
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = cor('#d8d8d8');            // faixas de pedestre
+    for (let s = 0; s < 6; s++) {
+      const o = 5 + s * 10;
+      ctx.fillRect(bx + o, by + RUA + 4, 5, 12); ctx.fillRect(bx + o, by + QUADRA - 16, 5, 12);
+      ctx.fillRect(bx + RUA + 4, by + o, 12, 5); ctx.fillRect(bx + QUADRA - 16, by + o, 12, 5);
+    }
+  });
+}
+
+function luzesNoChao(v) {                      // postes e faróis iluminando o asfalto
+  ctx.globalCompositeOperation = 'lighter';
+  paraCadaQuadra(v, (i, j) => brilho(i * QUADRA - 8, j * QUADRA - 8, 95, '255,180,90', 0.22));
+  [...transito, ...policia, jogador].forEach(c => {
+    if (c.batido) return;
+    const fx = Math.cos(c.ang), fy = Math.sin(c.ang), x = c.x + fx * 15, y = c.y + fy * 15;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, 150);
+    g.addColorStop(0, 'rgba(255,240,200,0.4)'); g.addColorStop(1, 'rgba(255,240,200,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.arc(x, y, 150, c.ang - 0.38, c.ang + 0.38); ctx.fill();
+    brilho(c.x - fx * 15, c.y - fy * 15, 16, '255,40,40', 0.45);
+  });
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#ffe2a8';
+  paraCadaQuadra(v, (i, j) => circulo(i * QUADRA - 8, j * QUADRA - 8, 2.5));
+}
+
+function desenharVeiculo(v) {
+  const luz = NOITE ? 1.8 : 1, azul = ((quadro >> 3) + (v.fase || 0)) % 2;
+  ctx.save(); ctx.translate(v.x, v.y); ctx.rotate(v.ang);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)'; retangulo(-13, -6, 30, 16, 4);       // sombra
+  ctx.fillStyle = cor(v.batido ? '#3a3a3a' : v.cor, luz); retangulo(-15, -8, 30, 16, 4);
+  ctx.fillStyle = cor('#16202c', luz); retangulo(2, -6, 7, 12, 2); retangulo(-12, -6, 5, 12, 2);
+  ctx.fillStyle = cor(v.batido ? '#3a3a3a' : v.cor, 0.85 * luz); retangulo(-6, -6, 8, 12, 2);
+  if (v.policia) {                             // giroflex
+    ctx.fillStyle = azul ? '#3060ff' : '#ff2030'; ctx.fillRect(-4, -7, 3, 7);
+    ctx.fillStyle = azul ? '#ff2030' : '#3060ff'; ctx.fillRect(-4, 0, 3, 7);
+  }
+  ctx.fillStyle = '#fff3c4'; ctx.fillRect(13, -7, 2, 3); ctx.fillRect(13, 4, 2, 3);
+  ctx.fillStyle = '#ff3030'; ctx.fillRect(-15, -7, 2, 3); ctx.fillRect(-15, 4, 2, 3);
+  ctx.restore();
+}
+
+function desenharPedestre(p) {
+  const luz = NOITE ? 1.8 : 1, perna = Math.sin(quadro * 0.25 * (p.susto ? 3 : 1)) * 2;
+  ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.ang); ctx.scale(2.3, 2.3);   // pedestre 2.3x maior
+  if (p.caido) {                               // deitado no chão
+    ctx.fillStyle = cor('#222222', luz); ctx.fillRect(-8, -2, 3, 1.5); ctx.fillRect(-8, 0.5, 3, 1.5);
+    ctx.fillStyle = cor(p.cor, luz); ctx.beginPath(); ctx.ellipse(0, 0, 5, 2.5, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = cor('#c68e64', luz); circulo(6, 0, 2.3);
+  } else {                                     // em pé, visto de cima: ombros, cabeça e pernas andando
+    ctx.fillStyle = cor('#222222', luz); ctx.fillRect(perna - 1, -3, 2, 2); ctx.fillRect(-perna - 1, 1, 2, 2);
+    ctx.fillStyle = cor(p.cor, luz); ctx.beginPath(); ctx.ellipse(0, 0, 2.5, 4.5, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = cor('#c68e64', luz); circulo(0.5, 0, 2.3);
+  }
+  ctx.restore();
+  if (p.susto > 0 && !p.caido) { ctx.fillStyle = '#ffd200'; ctx.font = 'bold 16px sans-serif'; ctx.textAlign = 'center'; ctx.fillText('!', p.x, p.y - 12); }
+}
+
+function desenharPredio(p, cx, cy) {
+  const s = CAMERA / (CAMERA - p.alt);         // quanto mais alto, mais o telhado "sai" na direção oposta à câmera
+  const base = [[p.x, p.y], [p.x + p.w, p.y], [p.x + p.w, p.y + p.h], [p.x, p.y + p.h]];
+  const topo = base.map(([x, y]) => [cx + (x - cx) * s, cy + (y - cy) * s]);
+  const viradaPraCamera = [cy < p.y, cx > p.x + p.w, cy > p.y + p.h, cx < p.x];
+  for (let k = 0; k < 4; k++) {
+    if (!viradaPraCamera[k]) continue;         // parede de trás nunca aparece
+    const b0 = base[k], b1 = base[(k + 1) % 4], t0 = topo[k], t1 = topo[(k + 1) % 4];
+    ctx.fillStyle = cor(p.cor, k % 2 ? 0.5 : 0.68);
+    poligono([b0, b1, t1, t0]);
+    const andares = Math.floor(p.alt / 20), colunas = Math.max(2, Math.round(p.w / 16));
+    const ponto = (u, v) => lerp(lerp(b0, b1, u), lerp(t0, t1, u), v);
+    for (let a = 0; a < andares; a++) for (let c = 0; c < colunas; c++) {
+      const acesa = NOITE && hash(p.semente + k, a, c) < 0.45;
+      ctx.fillStyle = acesa ? '#ffd27a' : cor('#2b3a52', NOITE ? 1 : 1.6);
+      const u0 = (c + 0.25) / colunas, u1 = (c + 0.75) / colunas, v0 = (a + 0.3) / andares, v1 = (a + 0.7) / andares;
+      poligono([ponto(u0, v0), ponto(u1, v0), ponto(u1, v1), ponto(u0, v1)]);
+    }
+  }
+  ctx.fillStyle = cor(p.cor); poligono(topo);  // telhado
+  const meio = lerp(topo[0], topo[2], 0.5);
+  ctx.fillStyle = cor(p.cor, 0.82); poligono(topo.map(pt => lerp(meio, pt, 0.82)));
+  if (NOITE && p.neon) {
+    ctx.save(); ctx.strokeStyle = p.neon; ctx.lineWidth = 2; ctx.shadowColor = p.neon; ctx.shadowBlur = 14;
+    poligono(topo, true); ctx.restore();
+  }
+}
+
+function desenharArvore(a, cx, cy) {
+  const s = CAMERA / (CAMERA - 35), x = cx + (a.x - cx) * s, y = cy + (a.y - cy) * s;
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; circulo(a.x + 3, a.y + 3, a.r);
+  ctx.fillStyle = cor('#2f6b2c'); circulo(x, y, a.r * s);
+  ctx.fillStyle = cor('#4d9443'); circulo(x - a.r * 0.25, y - a.r * 0.25, a.r * 0.6 * s);
+}
+
+function desenharPredios(v, cx, cy) {          // do mais longe pro mais perto, pra um cobrir o outro certo
+  const itens = [];
+  paraCadaQuadra(v, (i, j) => {
+    const q = quadra(i, j);
+    q.predios.forEach(p => itens.push([Math.hypot(p.x + p.w / 2 - cx, p.y + p.h / 2 - cy), () => desenharPredio(p, cx, cy)]));
+    q.arvores.forEach(a => itens.push([Math.hypot(a.x - cx, a.y - cy), () => desenharArvore(a, cx, cy)]));
+  });
+  itens.sort((a, b) => b[0] - a[0]).forEach(([, desenha]) => desenha());
+}
+
+function desenharMarcas() {
+  ctx.strokeStyle = 'rgba(10,10,12,0.45)'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+  ctx.beginPath();
+  marcas.forEach(m => { ctx.moveTo(m[0], m[1]); ctx.lineTo(m[2], m[3]); });
+  ctx.stroke();
+}
+
+function desenharParticulas() {
+  particulas.forEach(p => {
+    ctx.globalCompositeOperation = p.tipo === 'faisca' ? 'lighter' : 'source-over';
+    ctx.fillStyle = p.tipo === 'faisca' ? `rgba(255,200,80,${p.vida})`
+                  : p.tipo === 'fumacaEscura' ? `rgba(30,30,30,${p.vida * 0.5})` : `rgba(210,210,215,${p.vida * 0.3})`;
+    circulo(p.x, p.y, p.r);
+  });
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function desenharHUD() {
+  ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 6;
+  if (PASSO >= 4) {
+    ctx.font = '26px sans-serif'; ctx.textAlign = 'right';  // estrelas de procurado
+    for (let k = 0; k < 5; k++) {
+      const pisca = fuga > 240 && (quadro >> 4) % 2;
+      ctx.fillStyle = k < procurado && !pisca ? '#ffd200' : 'rgba(255,255,255,0.25)';
+      ctx.fillText('★', W - 14 - (4 - k) * 26, 84);
+    }
+    const kmh = Math.round(Math.hypot(jogador.vx, jogador.vy) * 22);  // velocímetro ao lado do minimapa
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 34px sans-serif'; ctx.fillText(kmh, 124, H - 172);
+    ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.font = '12px sans-serif'; ctx.fillText('KM/H', 126, H - 156);
+    minimapa();
+  }
+  ctx.shadowBlur = 0;
+  if (TOQUE) desenharBotoes();
+  if (!TOQUE && !document.hasFocus()) {        // sem foco o teclado não funciona: pede um clique
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, H / 2 - 40, W, 80);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#ffd200'; ctx.font = 'bold 20px sans-serif';
+    ctx.fillText('clique aqui pra jogar', W / 2, H / 2 + 7);
+  } else if (dica > 0) {
+    ctx.globalAlpha = Math.min(1, dica / 60); ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff'; ctx.font = '13px sans-serif';
+    ctx.fillText(TOQUE ? '▲ acelera · ◀ ▶ vira · ↯ derrapa · 1 a 4: passos' : 'setas: dirigir · espaço: derrapar · 1 a 4: passos', W / 2, TOQUE ? H - 140 : H - 100);
+    ctx.globalAlpha = 1;
+  }
+  if (mostrandoPreso > 0) {
+    ctx.fillStyle = 'rgba(0,0,40,0.45)'; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center'; ctx.font = 'bold 56px Impact, sans-serif'; ctx.fillStyle = '#4aa3ff';
+    ctx.fillText('PRESO!', W / 2, H / 2);
+  }
+}
+
+function minimapa() {
+  const R = 46, mx = 16 + R, my = H - 150 - R, s = 0.06;   // acima da área da legenda do Reels
+  ctx.save();
+  ctx.beginPath(); ctx.arc(mx, my, R, 0, 7); ctx.fillStyle = 'rgba(10,12,20,0.8)'; ctx.fill(); ctx.clip();
+  ctx.fillStyle = 'rgba(120,130,160,0.55)';
+  const i0 = Math.floor((jogador.x - R / s) / QUADRA), j0 = Math.floor((jogador.y - R / s) / QUADRA);
+  for (let i = i0; i < i0 + 9; i++) for (let j = j0; j < j0 + 9; j++)
+    ctx.fillRect(mx + (i * QUADRA + RUA - jogador.x) * s, my + (j * QUADRA + RUA - jogador.y) * s, (QUADRA - RUA) * s, (QUADRA - RUA) * s);
+  policia.forEach(p => { ctx.fillStyle = ((quadro >> 3) + p.fase) % 2 ? '#3060ff' : '#ff2030'; circulo(mx + (p.x - jogador.x) * s, my + (p.y - jogador.y) * s, 3); });
+  ctx.restore();
+  ctx.save(); ctx.translate(mx, my); ctx.rotate(jogador.ang);
+  ctx.fillStyle = '#ff3b5c'; poligono([[6, 0], [-4, -4], [-4, 4]]);
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(mx, my, R, 0, 7); ctx.stroke();
+}
+
+function desenhar() {
+  const z = cam.zoom, E = ESCALA;
+  const cx = cam.x + (Math.random() - 0.5) * tremor, cy = cam.y + (Math.random() - 0.5) * tremor;
+  ctx.setTransform(E * z, 0, 0, E * z, E * (W / 2 - cx * z), E * (H / 2 - cy * z));   // câmera
+  const v = { x0: cx - W / 2 / z, y0: cy - H / 2 / z, x1: cx + W / 2 / z, y1: cy + H / 2 / z };
+  desenharChao(v);
+  desenharMarcas();
+  if (NOITE) luzesNoChao(v);
+  pedestres.forEach(desenharPedestre);
+  [...transito, ...policia, jogador].forEach(desenharVeiculo);
+  if (PASSO >= 2) desenharPredios(v, cx, cy);
+  desenharParticulas();
+  if (NOITE) {
+    ctx.globalCompositeOperation = 'lighter';
+    policia.forEach(p => brilho(p.x, p.y, 70, ((quadro >> 3) + p.fase) % 2 ? '40,90,255' : '255,30,40', 0.5));
+    ctx.globalCompositeOperation = 'source-over';
+  }
+  ctx.setTransform(E, 0, 0, E, 0, 0);
+  desenharHUD();
+}
+
+// ================= LOOP (60 atualizações por segundo em qualquer monitor) =================
+let ultimo = performance.now(), acumulado = 0;
+function loop(agora) {
+  acumulado += Math.min(100, agora - ultimo); ultimo = agora;
+  while (acumulado >= 1000 / 60) { atualizar(); acumulado -= 1000 / 60; }
+  desenhar();
+  requestAnimationFrame(loop);
+}
+mudarPasso(PASSO);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
