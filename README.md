@@ -4,7 +4,7 @@ Um jogo de carro visto de cima, no estilo dos primeiros GTA, feito **só com HTM
 
 ![demonstração](docs/demo.gif)
 
-**▶ Jogar online:** `https://SEU-USUARIO.github.io/mini-gta-js/` *(veja abaixo como ativar)*
+**▶ Jogar online:** `https://claudineiaga.github.io/mini-gta-js/` *(veja abaixo como ativar)*
 
 | Dia | Noite |
 |---|---|
